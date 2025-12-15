@@ -54,13 +54,15 @@ use crate::encoding::tight::TightStreamCompressor;
 use crate::framebuffer::{DirtyRegion, Framebuffer};
 use crate::protocol::{
     PixelFormat, Rectangle, ServerInit, CLIENT_MSG_CLIENT_CUT_TEXT,
-    CLIENT_MSG_FRAMEBUFFER_UPDATE_REQUEST, CLIENT_MSG_KEY_EVENT, CLIENT_MSG_POINTER_EVENT,
-    CLIENT_MSG_SET_ENCODINGS, CLIENT_MSG_SET_PIXEL_FORMAT, ENCODING_COMPRESS_LEVEL_0,
-    ENCODING_COMPRESS_LEVEL_9, ENCODING_COPYRECT, ENCODING_CORRE, ENCODING_HEXTILE,
+    CLIENT_MSG_ENABLE_CONTINUOUS_UPDATES, CLIENT_MSG_FRAMEBUFFER_UPDATE_REQUEST,
+    CLIENT_MSG_KEY_EVENT, CLIENT_MSG_POINTER_EVENT, CLIENT_MSG_SET_ENCODINGS,
+    CLIENT_MSG_SET_PIXEL_FORMAT, ENCODING_COMPRESS_LEVEL_0, ENCODING_COMPRESS_LEVEL_9,
+    ENCODING_CONTINUOUS_UPDATES, ENCODING_COPYRECT, ENCODING_CORRE, ENCODING_HEXTILE,
     ENCODING_QUALITY_LEVEL_0, ENCODING_QUALITY_LEVEL_9, ENCODING_RAW, ENCODING_RRE, ENCODING_TIGHT,
     ENCODING_TIGHTPNG, ENCODING_ZLIB, ENCODING_ZLIBHEX, ENCODING_ZRLE, ENCODING_ZYWRLE,
     PROTOCOL_VERSION, SECURITY_RESULT_FAILED, SECURITY_RESULT_OK, SECURITY_TYPE_NONE,
-    SECURITY_TYPE_VNC_AUTH, SERVER_MSG_FRAMEBUFFER_UPDATE, SERVER_MSG_SERVER_CUT_TEXT,
+    SECURITY_TYPE_VNC_AUTH, SERVER_MSG_END_OF_CONTINUOUS_UPDATES, SERVER_MSG_FRAMEBUFFER_UPDATE,
+    SERVER_MSG_SERVER_CUT_TEXT,
 };
 use rfb_encodings::translate;
 
@@ -235,8 +237,17 @@ pub struct VncClient {
     /// The VNC quality level (0-9, or 255 for unset = use JPEG).
     /// Stored as an `AtomicU8` for atomic access from multiple contexts.
     quality_level: AtomicU8, // Atomic - VNC quality level (0-9, 255=unset)
-    /// A flag indicating whether the client has requested continuous framebuffer updates, stored as an `AtomicBool`.
-    continuous_updates: AtomicBool, // Atomic - simple bool flag
+    /// Whether the client supports the `ContinuousUpdates` extension (advertised via -313 pseudo-encoding).
+    /// When true, server has sent `EndOfContinuousUpdates` and client can send `EnableContinuousUpdates`.
+    supports_continuous_updates: AtomicBool, // Atomic - set when client advertises -313
+    /// Whether continuous updates are currently enabled via the `ContinuousUpdates` extension.
+    /// When true, server pushes updates without waiting for `FramebufferUpdateRequest`.
+    continuous_updates_enabled: AtomicBool, // Atomic - set by EnableContinuousUpdates message
+    /// The region for which continuous updates are enabled (when using `ContinuousUpdates` extension).
+    continuous_updates_region: RwLock<Option<DirtyRegion>>, // Protected - set by EnableContinuousUpdates
+    /// Legacy flag: whether server is actively sending updates after `FramebufferUpdateRequest`.
+    /// Used when client does NOT support `ContinuousUpdates` extension (traditional VNC behavior).
+    update_requested: AtomicBool, // Atomic - set by FramebufferUpdateRequest, cleared after update sent
     /// A shared, locked vector of `DirtyRegion`s specific to this client.
     /// These regions represent areas of the framebuffer that have been modified and need to be sent to the client.
     modified_regions: Arc<RwLock<Vec<DirtyRegion>>>, // Per-client dirty regions (standard VNC protocol style - receives pushes from framebuffer)
@@ -281,6 +292,8 @@ pub struct VncClient {
     destination_port: Option<u16>,
     /// Repeater ID for repeater connections (None for direct connections)
     repeater_id: Option<String>,
+    /// Request ID for tracking connection requests (optional, set by caller)
+    request_id: Option<String>,
     /// Unique client ID assigned by the server
     client_id: usize,
 }
@@ -404,7 +417,10 @@ impl VncClient {
             jpeg_quality: AtomicU8::new(80),     // Default quality
             compression_level: AtomicU8::new(6), // Default zlib compression (balanced)
             quality_level: AtomicU8::new(255),   // 255 = unset (use JPEG by default)
-            continuous_updates: AtomicBool::new(false),
+            supports_continuous_updates: AtomicBool::new(false), // Set when client advertises -313
+            continuous_updates_enabled: AtomicBool::new(false), // Set by EnableContinuousUpdates
+            continuous_updates_region: RwLock::new(None), // Region for continuous updates
+            update_requested: AtomicBool::new(false), // Legacy: set by FramebufferUpdateRequest
             modified_regions: Arc::new(RwLock::new(Vec::new())),
             requested_region: RwLock::new(None),
             copy_region: Arc::new(RwLock::new(Vec::new())), // Initialize empty copy region
@@ -422,6 +438,7 @@ impl VncClient {
             remote_host,
             destination_port: None, // None for direct inbound connections
             repeater_id: None,      // None for direct inbound connections
+            request_id: None,       // None for direct inbound connections
             client_id,
         })
     }
@@ -599,6 +616,23 @@ impl VncClient {
                                         #[cfg(feature = "debug-logging")]
                                         info!("Client requested compression level {compression_level}, using zlib level {compression_level}");
                                     }
+
+                                    // Check for ContinuousUpdates pseudo-encoding (-313)
+                                    if encoding == ENCODING_CONTINUOUS_UPDATES {
+                                        // Client supports ContinuousUpdates extension
+                                        // Send EndOfContinuousUpdates message to confirm support
+                                        if !self.supports_continuous_updates.load(Ordering::Relaxed) {
+                                            self.supports_continuous_updates.store(true, Ordering::Relaxed);
+                                            #[cfg(feature = "debug-logging")]
+                                            info!("Client supports ContinuousUpdates extension, sending EndOfContinuousUpdates");
+
+                                            // Send EndOfContinuousUpdates message (1 byte: type 150)
+                                            let _guard = self.send_mutex.lock().await;
+                                            if let Err(e) = self.write_stream.lock().await.write_all(&[SERVER_MSG_END_OF_CONTINUOUS_UPDATES]).await {
+                                                error!("Failed to send EndOfContinuousUpdates: {e}");
+                                            }
+                                        }
+                                    }
                                 }
                                 self.encodings.write().await.clone_from(&encodings_list);
                                 #[cfg(feature = "debug-logging")]
@@ -621,9 +655,9 @@ impl VncClient {
                                 // Track requested region (standard VNC protocol cl->requestedRegion)
                                 *self.requested_region.write().await = Some(DirtyRegion::new(x, y, width, height));
 
-                                // Enable continuous updates for both incremental and non-incremental requests
-                                // The difference is handled below: non-incremental clears and adds full region
-                                self.continuous_updates.store(true, Ordering::Relaxed);
+                                // Mark that an update was requested (traditional VNC behavior)
+                                // If ContinuousUpdates extension is enabled, this is ignored
+                                self.update_requested.store(true, Ordering::Relaxed);
 
                                 // Handle non-incremental updates (full refresh)
                                 if !incremental {
@@ -701,6 +735,39 @@ impl VncClient {
                                     let _ = self.event_tx.send(ClientEvent::CutText { text });
                                 }
                             }
+                            CLIENT_MSG_ENABLE_CONTINUOUS_UPDATES => {
+                                // EnableContinuousUpdates: enable(u8) + x(u16) + y(u16) + w(u16) + h(u16) = 10 bytes total
+                                if buf.len() < 10 {
+                                    break;
+                                }
+                                buf.advance(1); // message type
+                                let enable = buf.get_u8() != 0;
+                                let x = buf.get_u16();
+                                let y = buf.get_u16();
+                                let width = buf.get_u16();
+                                let height = buf.get_u16();
+
+                                if enable {
+                                    // Enable continuous updates for the specified region
+                                    let region = DirtyRegion::new(x, y, width, height);
+                                    *self.continuous_updates_region.write().await = Some(region);
+                                    self.continuous_updates_enabled.store(true, Ordering::Relaxed);
+                                    #[cfg(feature = "debug-logging")]
+                                    info!("ContinuousUpdates enabled for region ({x},{y} {width}x{height})");
+                                } else {
+                                    // Disable continuous updates
+                                    *self.continuous_updates_region.write().await = None;
+                                    self.continuous_updates_enabled.store(false, Ordering::Relaxed);
+                                    #[cfg(feature = "debug-logging")]
+                                    info!("ContinuousUpdates disabled");
+
+                                    // Send EndOfContinuousUpdates to confirm disable
+                                    let _guard = self.send_mutex.lock().await;
+                                    if let Err(e) = self.write_stream.lock().await.write_all(&[SERVER_MSG_END_OF_CONTINUOUS_UPDATES]).await {
+                                        error!("Failed to send EndOfContinuousUpdates: {e}");
+                                    }
+                                }
+                            }
                             _ => {
                                 error!("Unknown message type: {msg_type}, disconnecting client");
                                 let _ = self.event_tx.send(ClientEvent::Disconnected);
@@ -713,10 +780,15 @@ impl VncClient {
                     }
                 }
 
-                // Periodically check if we should send updates (standard VNC protocol style)
+                // Periodically check if we should send updates
                 _ = check_interval.tick() => {
-                    let continuous = self.continuous_updates.load(Ordering::Relaxed);
-                    if continuous {
+                    // Determine if updates should be sent:
+                    // - ContinuousUpdates extension enabled (client sent EnableContinuousUpdates with enable=true)
+                    // - OR traditional mode: FramebufferUpdateRequest received (update_requested=true)
+                    let cu_enabled = self.continuous_updates_enabled.load(Ordering::Relaxed);
+                    let update_requested = self.update_requested.load(Ordering::Relaxed);
+
+                    if cu_enabled || update_requested {
                         // Check if we have regions and deferral time has elapsed
                         // Regions are already pushed to us by framebuffer (no merge needed!)
                         let should_send = {
@@ -746,6 +818,12 @@ impl VncClient {
 
                         if should_send {
                             self.send_batched_update().await?;
+
+                            // In traditional mode (not ContinuousUpdates), clear the update_requested flag
+                            // This matches libvncserver behavior: after sending an update, wait for next request
+                            if !cu_enabled {
+                                self.update_requested.store(false, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -1732,6 +1810,16 @@ impl VncClient {
     pub fn set_repeater_metadata(&mut self, repeater_id: String, destination_port: Option<u16>) {
         self.repeater_id = Some(repeater_id);
         self.destination_port = destination_port;
+    }
+
+    /// Sets the request ID for tracking connection requests.
+    pub fn set_request_id(&mut self, request_id: String) {
+        self.request_id = Some(request_id);
+    }
+
+    /// Returns the request ID if set, or None.
+    pub fn get_request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
     }
 }
 
