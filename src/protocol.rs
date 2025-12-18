@@ -105,6 +105,13 @@ pub const CLIENT_MSG_POINTER_EVENT: u8 = 5;
 /// Allows the client to transfer clipboard contents to the server.
 pub const CLIENT_MSG_CLIENT_CUT_TEXT: u8 = 6;
 
+/// Message type: Client enables or disables Continuous Updates.
+///
+/// Part of the `ContinuousUpdates` extension. When enabled, the server
+/// pushes framebuffer updates without waiting for `FramebufferUpdateRequest`.
+/// Message format: type (u8) + enable (u8) + x (u16) + y (u16) + w (u16) + h (u16)
+pub const CLIENT_MSG_ENABLE_CONTINUOUS_UPDATES: u8 = 150;
+
 // Server-to-Client Message Types
 
 /// Message type: Server sends a framebuffer update.
@@ -130,6 +137,13 @@ pub const SERVER_MSG_BELL: u8 = 2;
 ///
 /// Allows the server to transfer clipboard contents to the client.
 pub const SERVER_MSG_SERVER_CUT_TEXT: u8 = 3;
+
+/// Message type: Server signals end of continuous updates.
+///
+/// Part of the `ContinuousUpdates` extension. Sent by the server to indicate
+/// it supports the `ContinuousUpdates` extension when client advertises -313.
+/// Also sent when continuous updates are disabled.
+pub const SERVER_MSG_END_OF_CONTINUOUS_UPDATES: u8 = 150;
 
 // Encoding Types
 //
@@ -194,6 +208,14 @@ pub const ENCODING_COMPRESS_LEVEL_0: i32 = -256;
 /// Requests the server to use maximum compression, trading CPU time
 /// for reduced bandwidth usage.
 pub const ENCODING_COMPRESS_LEVEL_9: i32 = -247;
+
+/// Pseudo-encoding: Continuous Updates.
+///
+/// When included in the client's encoding list, this indicates the client
+/// supports the `ContinuousUpdates` extension. The server should respond with
+/// an `EndOfContinuousUpdates` message (type 150) to confirm support.
+/// Once confirmed, the client can send `EnableContinuousUpdates` messages.
+pub const ENCODING_CONTINUOUS_UPDATES: i32 = -313;
 
 // Note: Hextile and Tight subencoding constants are re-exported from rfb-encodings
 // at the top of this file.

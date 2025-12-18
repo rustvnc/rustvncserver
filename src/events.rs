@@ -62,4 +62,32 @@ pub enum ServerEvent {
         /// Clipboard text content.
         text: String,
     },
+
+    /// The RFB ID message was sent to a VNC repeater.
+    ///
+    /// This event is emitted after the server sends the repeater ID message
+    /// to the VNC repeater. It's useful for tracking connection progress
+    /// in applications that need to report connection status.
+    RfbMessageSent {
+        /// Client identifier.
+        client_id: usize,
+        /// Optional request ID for tracking this connection.
+        request_id: Option<String>,
+        /// Whether the RFB ID message was sent successfully.
+        success: bool,
+    },
+
+    /// The VNC handshake completed after connecting to a repeater.
+    ///
+    /// This event is emitted after the VNC protocol handshake completes
+    /// with a client connected via a repeater. It indicates that the
+    /// connection is fully established and ready for use.
+    HandshakeComplete {
+        /// Client identifier.
+        client_id: usize,
+        /// Optional request ID for tracking this connection.
+        request_id: Option<String>,
+        /// Whether the handshake completed successfully.
+        success: bool,
+    },
 }

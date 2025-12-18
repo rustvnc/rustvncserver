@@ -112,6 +112,32 @@ pub enum ServerEvent {
         /// The cut text string
         text: String,
     },
+    /// The RFB ID message was sent to a VNC repeater.
+    ///
+    /// This event is emitted after the server sends the repeater ID message
+    /// to the VNC repeater. It's useful for tracking connection progress
+    /// in applications that need to report connection status.
+    RfbMessageSent {
+        /// The unique identifier for the client
+        client_id: usize,
+        /// The optional request ID for tracking this connection
+        request_id: Option<String>,
+        /// Whether the RFB ID message was sent successfully
+        success: bool,
+    },
+    /// The VNC handshake completed after connecting to a repeater.
+    ///
+    /// This event is emitted after the VNC protocol handshake completes
+    /// with a client connected via a repeater. It indicates that the
+    /// connection is fully established and ready for use.
+    HandshakeComplete {
+        /// The unique identifier for the client
+        client_id: usize,
+        /// The optional request ID for tracking this connection
+        request_id: Option<String>,
+        /// Whether the handshake completed successfully
+        success: bool,
+    },
 }
 
 impl VncServer {
@@ -694,6 +720,214 @@ impl VncServer {
 
                     // Spawn task to handle client messages
                     // Note: Same write lock behavior as regular clients (see handle_client)
+                    let client_arc_clone = client_arc.clone();
+                    let msg_handle = tokio::spawn(async move {
+                        let result = {
+                            let mut client = client_arc_clone.write().await;
+                            client.handle_messages().await
+                        };
+                        if let Err(e) = result {
+                            error!("Repeater client {client_id} message handling error: {e}");
+                        }
+                    });
+
+                    // Store the message handler task handle
+                    client_tasks.write().await.push(msg_handle);
+
+                    // Handle client events
+                    while let Some(event) = client_event_rx.recv().await {
+                        match event {
+                            ClientEvent::KeyPress { down, key } => {
+                                let _ = server_event_tx.send(ServerEvent::KeyPress {
+                                    client_id,
+                                    down,
+                                    key,
+                                });
+                            }
+                            ClientEvent::PointerMove { x, y, button_mask } => {
+                                let _ = server_event_tx.send(ServerEvent::PointerMove {
+                                    client_id,
+                                    x,
+                                    y,
+                                    button_mask,
+                                });
+                            }
+                            ClientEvent::CutText { text } => {
+                                let _ =
+                                    server_event_tx.send(ServerEvent::CutText { client_id, text });
+                            }
+                            ClientEvent::Disconnected => {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Remove client from list
+                    let mut clients_guard = clients.write().await;
+                    clients_guard.retain(|c| !Arc::ptr_eq(c, &client_arc));
+                    drop(clients_guard);
+
+                    let mut client_ids_guard = client_ids.write().await;
+                    client_ids_guard.retain(|&id| id != client_id);
+                    drop(client_ids_guard);
+
+                    let _ = server_event_tx.send(ServerEvent::ClientDisconnected { client_id });
+
+                    log::info!("Repeater client {client_id} disconnected");
+                }
+                Err(e) => {
+                    error!("Failed to connect to repeater: {e}");
+                }
+            }
+        });
+
+        // Wait for connection to complete before returning to caller
+        match result_rx.await {
+            Ok(Ok(())) => Ok(client_id),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::other(
+                "Repeater connection task died unexpectedly",
+            )),
+        }
+    }
+
+    /// Connects to a VNC repeater with an optional request ID for tracking.
+    ///
+    /// This is an extended version of [`VncServer::connect_repeater`] that accepts an optional
+    /// `request_id` parameter for tracking connection requests. The request ID is
+    /// stored as client metadata.
+    ///
+    /// When a `request_id` is provided, this method also emits progress events:
+    /// - [`ServerEvent::RfbMessageSent`] - when the RFB ID message is sent to the repeater
+    /// - [`ServerEvent::HandshakeComplete`] - when the VNC handshake completes
+    ///
+    /// # Arguments
+    ///
+    /// * `repeater_host` - The hostname or IP address of the VNC repeater.
+    /// * `repeater_port` - The port of the VNC repeater.
+    /// * `repeater_id` - The ID to use when connecting to the repeater.
+    /// * `request_id` - Optional request ID for tracking this connection request.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(client_id)` if the connection is successful.
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` if the connection fails (network error, authentication failure, etc.).
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cast_possible_truncation)]
+    pub async fn connect_repeater_with_request_id(
+        &self,
+        repeater_host: String,
+        repeater_port: u16,
+        repeater_id: String,
+        request_id: Option<String>,
+    ) -> Result<usize, std::io::Error> {
+        use crate::repeater::{connect_repeater_with_progress, RepeaterProgress};
+
+        // Safely increment client ID counter and check for overflow
+        let client_id_raw = NEXT_CLIENT_ID.fetch_add(1, Ordering::SeqCst);
+        if client_id_raw == 0 || client_id_raw >= u64::MAX - 1000 {
+            return Err(std::io::Error::other("Client ID counter overflow"));
+        }
+        let client_id = client_id_raw as usize;
+
+        let framebuffer = self.framebuffer.clone();
+        let desktop_name = self.desktop_name.clone();
+        let password = self.password.clone();
+        let clients = self.clients.clone();
+        let client_write_streams = self.client_write_streams.clone();
+        let client_tasks = self.client_tasks.clone();
+        let client_ids = self.client_ids.clone();
+        let server_event_tx = self.event_tx.clone();
+        let request_id_clone = request_id.clone();
+
+        // Use oneshot channel to wait for connection result before returning
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (client_event_tx, mut client_event_rx) = mpsc::unbounded_channel();
+
+            // Create progress channel for repeater connection events
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+
+            // Spawn a task to forward progress events to server events
+            let server_event_tx_progress = server_event_tx.clone();
+            let request_id_for_progress = request_id_clone.clone();
+            tokio::spawn(async move {
+                while let Some(progress) = progress_rx.recv().await {
+                    match progress {
+                        RepeaterProgress::RfbMessageSent { success } => {
+                            let _ = server_event_tx_progress.send(ServerEvent::RfbMessageSent {
+                                client_id,
+                                request_id: request_id_for_progress.clone(),
+                                success,
+                            });
+                        }
+                        RepeaterProgress::HandshakeComplete { success } => {
+                            let _ = server_event_tx_progress.send(ServerEvent::HandshakeComplete {
+                                client_id,
+                                request_id: request_id_for_progress.clone(),
+                                success,
+                            });
+                        }
+                    }
+                }
+            });
+
+            let connection_result = connect_repeater_with_progress(
+                client_id,
+                repeater_host,
+                repeater_port,
+                repeater_id,
+                framebuffer.clone(),
+                desktop_name,
+                password,
+                client_event_tx,
+                Some(progress_tx),
+            )
+            .await;
+
+            // Send connection result back to caller
+            let _ = result_tx.send(
+                connection_result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|e| std::io::Error::new(e.kind(), e.to_string())),
+            );
+
+            match connection_result {
+                Ok(mut client) => {
+                    // Set request_id on the client if provided
+                    if let Some(req_id) = request_id_clone {
+                        client.set_request_id(req_id);
+                    }
+
+                    log::info!(
+                        "Repeater connection {client_id} established (with request_id tracking)"
+                    );
+
+                    let client_arc = Arc::new(RwLock::new(client));
+
+                    // Register client to receive dirty region notifications
+                    let regions_arc = client_arc.read().await.get_receiver_handle();
+                    let receiver = DirtyRegionReceiver::new(Arc::downgrade(&regions_arc));
+                    framebuffer.register_receiver(receiver).await;
+
+                    // Store the write stream handle for direct socket shutdown
+                    let write_stream_handle = {
+                        let client = client_arc.read().await;
+                        client.get_write_stream_handle()
+                    };
+                    client_write_streams.write().await.push(write_stream_handle);
+
+                    clients.write().await.push(client_arc.clone());
+                    client_ids.write().await.push(client_id);
+
+                    let _ = server_event_tx.send(ServerEvent::ClientConnected { client_id });
+
+                    // Spawn task to handle client messages
                     let client_arc_clone = client_arc.clone();
                     let msg_handle = tokio::spawn(async move {
                         let result = {

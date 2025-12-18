@@ -142,3 +142,139 @@ pub async fn connect_repeater(
     info!("VNC repeater connection established successfully");
     Ok(client)
 }
+
+/// Progress events emitted during repeater connection.
+///
+/// These events allow applications to track the progress of a repeater
+/// connection and receive callbacks at key points during the connection process.
+#[derive(Debug, Clone)]
+pub enum RepeaterProgress {
+    /// The RFB ID message was sent to the repeater.
+    RfbMessageSent {
+        /// Whether the send was successful
+        success: bool,
+    },
+    /// The VNC handshake completed.
+    HandshakeComplete {
+        /// Whether the handshake was successful
+        success: bool,
+    },
+}
+
+/// Connects to a VNC repeater with progress callbacks.
+///
+/// This is an extended version of [`connect_repeater`] that emits progress
+/// events during the connection process. This is useful for applications
+/// that need to track connection status or provide feedback to users.
+///
+/// # Arguments
+///
+/// All arguments are the same as [`connect_repeater`], plus:
+/// * `progress_tx` - An optional channel to send progress events during connection.
+///
+/// # Returns
+///
+/// Same as [`connect_repeater`].
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_repeater_with_progress(
+    client_id: usize,
+    repeater_host: String,
+    repeater_port: u16,
+    repeater_id: String,
+    framebuffer: Framebuffer,
+    desktop_name: String,
+    password: Option<String>,
+    event_tx: mpsc::UnboundedSender<ClientEvent>,
+    progress_tx: Option<mpsc::UnboundedSender<RepeaterProgress>>,
+) -> Result<VncClient, io::Error> {
+    #[cfg(feature = "debug-logging")]
+    info!("Connecting to VNC repeater {repeater_host}:{repeater_port} with ID: {repeater_id}");
+
+    // Connect to repeater
+    #[cfg(feature = "debug-logging")]
+    info!("Attempting TCP connection to {repeater_host}:{repeater_port}...");
+    let mut stream = match TcpStream::connect(format!("{repeater_host}:{repeater_port}")).await {
+        Ok(s) => {
+            #[cfg(feature = "debug-logging")]
+            info!("TCP connection established to {repeater_host}:{repeater_port}");
+            s
+        }
+        Err(e) => {
+            error!("Failed to establish TCP connection to {repeater_host}:{repeater_port}: {e}");
+            return Err(e);
+        }
+    };
+
+    // Format ID string: "ID:xxxxx" padded to 250 bytes with nulls
+    let mut id_buffer = [0u8; 250];
+    let id_string = format!("ID:{repeater_id}");
+
+    // Validate ID length
+    if id_string.len() > 250 {
+        // Emit failure event before returning error
+        if let Some(tx) = &progress_tx {
+            let _ = tx.send(RepeaterProgress::RfbMessageSent { success: false });
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Repeater ID too long (max 246 characters after 'ID:' prefix)",
+        ));
+    }
+
+    // Copy ID string into buffer (rest remains null)
+    id_buffer[..id_string.len()].copy_from_slice(id_string.as_bytes());
+
+    // Send ID to repeater
+    #[cfg(feature = "debug-logging")]
+    info!("Sending repeater ID: {id_string}");
+    if let Err(e) = stream.write_all(&id_buffer).await {
+        error!("Failed to send repeater ID to {repeater_host}:{repeater_port}: {e}");
+        // Emit failure event
+        if let Some(tx) = &progress_tx {
+            let _ = tx.send(RepeaterProgress::RfbMessageSent { success: false });
+        }
+        return Err(e);
+    }
+
+    // Emit success event for RFB message sent
+    if let Some(tx) = &progress_tx {
+        let _ = tx.send(RepeaterProgress::RfbMessageSent { success: true });
+    }
+
+    #[cfg(feature = "debug-logging")]
+    info!("Repeater ID sent, proceeding with VNC handshake");
+
+    // Now proceed with normal VNC client handshake
+    let client_result = VncClient::new(
+        client_id,
+        stream,
+        framebuffer,
+        desktop_name,
+        password,
+        event_tx,
+    )
+    .await;
+
+    match client_result {
+        Ok(mut client) => {
+            // Emit handshake success event
+            if let Some(tx) = &progress_tx {
+                let _ = tx.send(RepeaterProgress::HandshakeComplete { success: true });
+            }
+
+            // Set repeater metadata for client management APIs
+            client.set_repeater_metadata(repeater_id, Some(repeater_port));
+
+            #[cfg(feature = "debug-logging")]
+            info!("VNC repeater connection established successfully");
+            Ok(client)
+        }
+        Err(e) => {
+            // Emit handshake failure event
+            if let Some(tx) = &progress_tx {
+                let _ = tx.send(RepeaterProgress::HandshakeComplete { success: false });
+            }
+            Err(e)
+        }
+    }
+}
