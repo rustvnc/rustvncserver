@@ -22,7 +22,7 @@ thiserror = "1.0"       # Error handling
 des = "0.8"             # DES encryption for VNC auth
 rand = "0.8"            # Random number generation for auth
 flate2 = "1.0"          # Zlib compression for Tight encoding
-rfb-encodings = "0.1.5"   # RFB encoding implementations
+rfb-encodings = "0.1.6"   # RFB encoding implementations
 
 [features]
 default = []
