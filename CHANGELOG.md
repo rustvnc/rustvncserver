@@ -5,6 +5,23 @@ All notable changes to rustvncserver will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2025-12-17
+
+### Added
+
+- **ContinuousUpdates Extension (RFC 6143):**
+  - Pseudo-encoding -313 for client capability advertisement
+  - Send EndOfContinuousUpdates (message type 150) when client advertises support
+  - Handle EnableContinuousUpdates message to enable/disable push updates
+  - When enabled, server pushes updates without waiting for FramebufferUpdateRequest
+  - When disabled, uses traditional request-response model
+
+- **Repeater Progress Events:**
+  - `RfbMessageSent` event - emitted when RFB ID sent to repeater
+  - `HandshakeComplete` event - emitted when VNC handshake completes
+  - Request ID tracking for correlating connection events
+  - `connect_repeater_with_request_id()` and `connect_repeater_with_progress()` APIs
+
 ## [2.1.0] - 2025-12-17
 
 ### Fixed
