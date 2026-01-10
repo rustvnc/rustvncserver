@@ -68,7 +68,7 @@ impl VncAuth {
     /// A `[u8; 16]` array containing the random challenge bytes.
     #[allow(clippy::unused_self)] // Kept as method for API consistency with other VncAuthenticator methods
     pub fn generate_challenge(&self) -> [u8; 16] {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut challenge = [0u8; 16];
         rng.fill(&mut challenge);
         challenge
