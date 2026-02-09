@@ -1118,13 +1118,15 @@ impl VncClient {
             not(feature = "debug-logging"),
             allow(unused_variables, unused_assignments)
         )]
-        let mut total_pixels = 0u64;
+        #[cfg(feature = "debug-logging")]
+        {
+            let mut total_pixels = 0u64;
+            let mut copy_rect_count = 0;
+        }
         #[cfg_attr(
             not(feature = "debug-logging"),
             allow(unused_variables, unused_assignments)
         )]
-        let mut copy_rect_count = 0;
-
         // Load quality/compression settings atomically
         let jpeg_quality = self.jpeg_quality.load(Ordering::Relaxed);
         let compression_level = self.compression_level.load(Ordering::Relaxed);
@@ -1155,9 +1157,11 @@ impl VncClient {
                 // CopyRect data is just src_x and src_y
                 response.put_u16(src_x);
                 response.put_u16(src_y);
-
-                total_pixels += u64::from(region.width) * u64::from(region.height);
-                copy_rect_count += 1;
+                #[cfg(feature = "debug-logging")]
+                {
+                    total_pixels += u64::from(region.width) * u64::from(region.height);
+                    copy_rect_count += 1;
+                }
             }
         }
 
@@ -1223,11 +1227,10 @@ impl VncClient {
 
                     rect.write_header(&mut response);
                     response.extend_from_slice(encoded);
-
-                    total_pixels += u64::from(*w) * u64::from(*h);
-
                     #[cfg(feature = "debug-logging")]
                     {
+                        total_pixels += u64::from(*w) * u64::from(*h);
+
                         rect_count += 1;
                     }
                 }
@@ -1323,8 +1326,10 @@ impl VncClient {
 
                                 // Write encoder output (background color + subrectangle data)
                                 response.extend_from_slice(&encoded);
-
-                                total_pixels += u64::from(tile_width) * u64::from(tile_height);
+                                #[cfg(feature = "debug-logging")]
+                                {
+                                    total_pixels += u64::from(tile_width) * u64::from(tile_height);
+                                }
                             }
 
                             x += tile_width;
@@ -1705,8 +1710,10 @@ impl VncClient {
                 };
                 rect.write_header(&mut response);
                 response.extend_from_slice(&encoded);
-
-                total_pixels += u64::from(region.width) * u64::from(region.height);
+                #[cfg(feature = "debug-logging")]
+                {
+                    total_pixels += u64::from(region.width) * u64::from(region.height);
+                }
             }
         }
 
